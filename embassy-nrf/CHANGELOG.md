@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## Unreleased - ReleaseDate
 
+- bugfix: buffered uarte v2: stop receiving when the buffer is full instead of panicking (backport of 242989e)
+- changed: buffered uarte v2: a hardware receive overrun returns `Error::Overrun` from reads instead of panicking, as v1 does
+
 ## 0.11.0 - 2026-06-16
 
 - added: support for the SQSPI peripheral for nRF54.

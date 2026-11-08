@@ -39,7 +39,9 @@ pub(crate) struct State {
     tx_count: AtomicUsize,
 
     rx_buf: RingBuffer,
+    /// Whether a RX DMA transfer is currently in progress.
     rx_started: AtomicBool,
+    rx_overrun: AtomicBool,
 }
 
 /// UART error.
@@ -47,12 +49,15 @@ pub(crate) struct State {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Error {
-    // No errors for now
+    /// The UART received a byte before the previous one was stored, so data was lost.
+    Overrun,
 }
 
 impl core::fmt::Display for Error {
-    fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match *self {}
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Error::Overrun => write!(f, "UART Overrun"),
+        }
     }
 }
 
@@ -66,6 +71,7 @@ impl State {
 
             rx_buf: RingBuffer::new(),
             rx_started: AtomicBool::new(false),
+            rx_overrun: AtomicBool::new(false),
         }
     }
 }
@@ -91,35 +97,40 @@ impl<U: UarteInstance> interrupt::typelevel::Handler<U::Interrupt> for Interrupt
                 r.errorsrc().write_value(errs);
 
                 if errs.overrun() {
-                    panic!("BufferedUarte UART overrun");
+                    s.rx_overrun.store(true, Ordering::Release);
+                    ss.rx_waker.wake();
                 }
             }
 
-            let first_run = !s.rx_started.swap(true, Ordering::Relaxed);
-            if r.events_dma().rx().end().read() != 0 || first_run {
+            if r.events_dma().rx().end().read() != 0 {
                 //trace!("  irq_rx: endrx");
                 r.events_dma().rx().end().write_value(0);
 
-                if !first_run {
+                if s.rx_started.swap(false, Ordering::Relaxed) {
                     // Received some bytes, wake task.
                     let rxed = r.dma().rx().amount().read().amount() as usize;
                     rx.push_done(rxed);
                     ss.rx_waker.wake();
                 }
+            }
 
+            if !s.rx_started.load(Ordering::Relaxed) {
                 let (ptr, len) = rx.push_buf();
-                if len == 0 {
-                    panic!("BufferedUarte buffer overrun");
+
+                // If the buffer is full, leave the DMA stopped. `consume()` pends the interrupt
+                // again once the user has freed up some space.
+                if len != 0 {
+                    let len = min(len, half_len);
+
+                    // Set up the DMA read
+                    r.dma().rx().ptr().write_value(ptr as u32);
+                    r.dma().rx().maxcnt().write(|w| w.set_maxcnt(len as _));
+
+                    s.rx_started.store(true, Ordering::Relaxed);
+
+                    // manually start
+                    r.tasks_dma().rx().start().write_value(1);
                 }
-
-                let len = if len > half_len { half_len } else { len };
-
-                // Set up the DMA read
-                r.dma().rx().ptr().write_value(ptr as u32);
-                r.dma().rx().maxcnt().write(|w| w.set_maxcnt(len as _));
-
-                // manually start
-                r.tasks_dma().rx().start().write_value(1);
             }
         }
 
@@ -516,6 +527,8 @@ impl<'d, U: UarteInstance> BufferedUarteRx<'d, U> {
         let rx_len = rx_buffer.len().min(EASY_DMA_SIZE * 2);
         let rx_ptr = rx_buffer.as_mut_ptr();
         unsafe { s.rx_buf.init(rx_ptr, rx_len) };
+        s.rx_started.store(false, Ordering::Relaxed);
+        s.rx_overrun.store(false, Ordering::Relaxed);
 
         // clear errors
         let errors = r.errorsrc().read();
@@ -559,6 +572,11 @@ impl<'d, U: UarteInstance> BufferedUarteRx<'d, U> {
 
             let s = U::buffered_state();
             let ss = U::state();
+
+            if s.rx_overrun.swap(false, Ordering::Acquire) {
+                return Poll::Ready(Err(Error::Overrun));
+            }
+
             let mut rx = unsafe { s.rx_buf.reader() };
 
             let (ptr, n) = rx.pop_buf();
@@ -581,11 +599,19 @@ impl<'d, U: UarteInstance> BufferedUarteRx<'d, U> {
         let s = U::buffered_state();
         let mut rx = unsafe { s.rx_buf.reader() };
         rx.pop_done(amt);
+
+        // If the DMA is stopped because the buffer was full, restart it now that there's space.
+        if !s.rx_started.load(Ordering::Relaxed) {
+            U::Interrupt::pend();
+        }
     }
 
     /// we are ready to read if there is data in the buffer
     fn read_ready() -> Result<bool, Error> {
         let state = U::buffered_state();
+        if state.rx_overrun.swap(false, Ordering::Acquire) {
+            return Err(Error::Overrun);
+        }
         Ok(!state.rx_buf.is_empty())
     }
 }
@@ -612,7 +638,9 @@ mod _embedded_io {
 
     impl embedded_io_async::Error for Error {
         fn kind(&self) -> embedded_io_async::ErrorKind {
-            match *self {}
+            match *self {
+                Error::Overrun => embedded_io_async::ErrorKind::OutOfMemory,
+            }
         }
     }
 
